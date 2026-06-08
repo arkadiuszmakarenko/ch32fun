@@ -167,3 +167,46 @@ uint8_t USBH_SetConfig( uint8_t ep0_size, uint8_t cfg )
 	s = USBH_CtrlXfer( &req, NULL, 0, ep0_size, &got );
 	return s;
 }
+
+// ---------------------------------------------------------------------------
+// USBH_GetHidReportDesc
+//
+// GET_DESCRIPTOR(HID_REPORT) for the given interface. Per USB HID 1.11
+// §4.2 this is a class-specific GET_DESCRIPTOR, device-to-host,
+// recipient = interface, descriptor type = 0x22.
+//
+// We do the two-step read (just like GetConfigDesc): if the caller
+// passes a *plen that's larger than what the device's first chunk
+// reveals, we re-issue. In practice the descriptor is short enough
+// (typically < 256 bytes for mice/joysticks, occasionally up to ~1 KB
+// for gaming keyboards) that the first call almost always returns the
+// whole thing.
+//
+//   ep0_size  - bMaxPacketSize0
+//   iface     - bInterfaceNumber of the HID interface
+//   pbuf      - caller-supplied buffer
+//   plen      - in: buffer capacity; out: actual bytes read
+// ---------------------------------------------------------------------------
+uint8_t USBH_GetHidReportDesc( uint8_t ep0_size, uint8_t iface,
+                               uint8_t *pbuf, uint16_t *plen )
+{
+	USBH_SetupReq req;
+	uint16_t got = 0;
+	uint8_t  s;
+
+	if( pbuf == NULL || plen == NULL || *plen == 0 ) {
+		return USBH_ERR_USB_UNKNOWN;
+	}
+
+	req.bmRequestType = 0x81u;  // device-to-host, standard, interface
+	req.bRequest       = USBH_REQ_GET_DESCRIPTOR;
+	USBH_Put16( (uint8_t*)&req.wValue, ( USBH_DESC_HID_REPORT << 8 ) );
+	USBH_Put16( (uint8_t*)&req.wIndex, iface );
+	USBH_Put16( (uint8_t*)&req.wLength, *plen );
+
+	s = USBH_CtrlXfer( &req, pbuf, *plen, ep0_size, &got );
+	if( s != USBH_ERR_SUCCESS ) return s;
+
+	*plen = got;
+	return USBH_ERR_SUCCESS;
+}

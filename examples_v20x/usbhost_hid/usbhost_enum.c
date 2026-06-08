@@ -3,7 +3,8 @@
 // Carries the same enumeration state machine as the usbhost_enum
 // reference, but at the end of a successful enumeration we call
 // USBH_HidInit() and then loop on USBH_HidReadReport(), printing
-// decoded keyboard characters and mouse deltas.
+// decoded keyboard characters, mouse deltas + scroll + extra buttons,
+// joystick axes, and Xbox 360 button states.
 
 #include "ch32fun.h"
 #include <stdio.h>
@@ -26,9 +27,10 @@ static uint8_t CfgDesc[ USBH_CFG_DESC_BUFFER_SIZE ];
 static uint8_t  g_hid_ep;
 static uint16_t g_hid_maxp;
 static uint8_t  g_hid_interval;
+static uint8_t  g_hid_kind;        // one of USBH_HID_KIND_*
 static uint8_t  g_hid_rep_len;
 static uint8_t  g_hid_tog;
-static uint8_t  g_hid_kind;   // 0=none, 1=keyboard, 2=mouse
+static hid_report_t g_hid_desc;   // parsed HID report descriptor
 
 // Pretty-printers (subset of the reference project's).
 static const char *USBH_ClassName( uint8_t class_code )
@@ -127,24 +129,37 @@ void USBH_OnEnumSuccess( uint8_t speed,
 	const uint8_t *cfg_desc,
 	uint16_t       cfg_len )
 {
-	(void)speed; (void)dev_desc;
+	(void)speed;
 
-	g_hid_kind = 0;
-	uint8_t s = USBH_HidInit( cfg_desc, cfg_len,
-		&g_hid_rep_len, &g_hid_ep,
-		&g_hid_maxp,    &g_hid_interval );
+	memset( &g_hid_desc, 0, sizeof g_hid_desc );
+	g_hid_kind = USBH_HID_KIND_NONE;
+
+	uint8_t s = USBH_HidInit( dev_desc, cfg_desc, cfg_len,
+		&g_hid_kind, &g_hid_rep_len,
+		&g_hid_ep,   &g_hid_maxp,
+		&g_hid_interval,
+		&g_hid_desc );
 	if( s != USBH_ERR_SUCCESS )
 	{
 		printf( "[hid] init failed %02x (not a boot-protocol HID?)\n", s );
 		return;
 	}
 	g_hid_tog = 0;
-	// Heuristic: 8-byte report -> keyboard, 3-byte -> mouse.
-	g_hid_kind = ( g_hid_rep_len == 8 ) ? 1 : ( g_hid_rep_len == 3 ? 2 : 0 );
-	printf( "[hid] ready: %s (report=%u)\n",
-		g_hid_kind == 1 ? "keyboard" :
-		g_hid_kind == 2 ? "mouse"    : "unknown",
-		g_hid_rep_len );
+
+	const char *kind_str = "?";
+	switch( g_hid_kind )
+	{
+		case USBH_HID_KIND_KEYBOARD: kind_str = "keyboard";   break;
+		case USBH_HID_KIND_MOUSE:    kind_str = "mouse";      break;
+		case USBH_HID_KIND_GAMEPAD:  kind_str = "gamepad/joy"; break;
+		case USBH_HID_KIND_XBOX360:  kind_str = "xbox360";    break;
+	}
+	printf( "[hid] ready: %s (report=%u, report_id=%u, axes=([0]%u/%u, [1]%u/%u), wheel=%u/%u, buttons=%u)\n",
+		kind_str, g_hid_rep_len, g_hid_desc.report_id,
+		g_hid_desc.axis[0].size, g_hid_desc.axis[0].logical.min,
+		g_hid_desc.axis[1].size, g_hid_desc.axis[1].logical.min,
+		g_hid_desc.wheel.size,   g_hid_desc.wheel.logical.min,
+		g_hid_desc.button_count );
 }
 
 // Print new keypresses from a boot-keyboard report (skip autorepeats).
@@ -171,12 +186,97 @@ static void USBH_HidKbdHandle( const USBH_HidKbdReport *r )
 	memcpy( prev_kbd_keys, r->keycode, 6 );
 }
 
-static void USBH_HidMouseHandle( const USBH_HidMouseReport *r )
+static void USBH_HidMouseHandle( const USBH_HidInputReport *r )
 {
-	if( r->buttons || r->x || r->y )
+	if( r->buttons || r->x || r->y || r->wheel ||
+	    r->buttons_extra )
 	{
-		printf( "[mouse] btn=%02x dx=%d dy=%d\n",
-			r->buttons, (int)r->x, (int)r->y );
+		printf( "[mouse] btn=%02x btnX=%02x dx=%d dy=%d wheel=%d\n",
+			r->buttons, r->buttons_extra,
+			(int)r->x, (int)r->y, (int)r->wheel );
+	}
+}
+
+static void USBH_HidGamepadHandle( const USBH_HidInputReport *r )
+{
+	if( r->buttons || r->buttons_extra || r->x || r->y )
+	{
+		printf( "[gamepad] btn=%02x btnX=%02x x=%d y=%d\n",
+			r->buttons, r->buttons_extra,
+			(int)r->x, (int)r->y );
+	}
+}
+
+static const char *USBH_XboxBtnName( uint8_t b )
+{
+	switch( b )
+	{
+		case 0x01: return "UP";     case 0x02: return "DOWN";
+		case 0x04: return "LEFT";   case 0x08: return "RIGHT";
+		case 0x10: return "START";  case 0x20: return "BACK";
+		case 0x40: return "L3";     case 0x80: return "R3";
+		default:   return NULL;
+	}
+}
+
+static const char *USBH_XboxBtnNameH( uint8_t b )
+{
+	switch( b )
+	{
+		case 0x10: return "A";     case 0x20: return "B";
+		case 0x40: return "X";     case 0x80: return "Y";
+		case 0x01: return "LB";    case 0x02: return "RB";
+		case 0x04: return "GUIDE";
+		default:   return NULL;
+	}
+}
+
+static void USBH_HidX360Handle( const USBH_HidX360Report *r )
+{
+	static uint8_t prev_low = 0, prev_high = 0;
+	uint8_t now_low  = r->buttons_low;
+	uint8_t now_high = r->buttons_high;
+
+	// Rising-edge print for the basic buttons (only fire on press).
+	if( now_low != prev_low )
+	{
+		uint8_t diff = (uint8_t)( now_low & ~prev_low );
+		for( uint8_t b = 0; b < 8; b++ )
+		{
+			if( diff & ( 1u << b ) )
+			{
+				const char *n = USBH_XboxBtnName( (uint8_t)( 1u << b ) );
+				if( n ) printf( "[x360] dpad/btn: %s\n", n );
+			}
+		}
+		prev_low = now_low;
+	}
+	if( now_high != prev_high )
+	{
+		uint8_t diff = (uint8_t)( now_high & ~prev_high );
+		for( uint8_t b = 0; b < 8; b++ )
+		{
+			if( diff & ( 1u << b ) )
+			{
+				const char *n = USBH_XboxBtnNameH( (uint8_t)( 1u << b ) );
+				if( n ) printf( "[x360] btn: %s\n", n );
+			}
+		}
+		prev_high = now_high;
+	}
+
+	// Sticks: only print on a meaningful change (1% threshold).
+	static int16_t plx = 0, ply = 0, prx = 0, pry = 0;
+	if( ( r->lx > plx + 1000 ) || ( r->lx < plx - 1000 ) ||
+	    ( r->ly > ply + 1000 ) || ( r->ly < ply - 1000 ) ||
+	    ( r->rx > prx + 1000 ) || ( r->rx < prx - 1000 ) ||
+	    ( r->ry > pry + 1000 ) || ( r->ry < pry - 1000 ) ||
+	    r->lt > 0 || r->rt > 0 )
+	{
+		printf( "[x360] LX=%d LY=%d RX=%d RY=%d LT=%u RT=%u\n",
+			(int)r->lx, (int)r->ly, (int)r->rx, (int)r->ry,
+			(unsigned)r->lt, (unsigned)r->rt );
+		plx = r->lx; ply = r->ly; prx = r->rx; pry = r->ry;
 	}
 }
 
@@ -214,7 +314,7 @@ int main( void )
 					printf( "[usbhost_hid] device removed\n" );
 					speed = USB_SPEED_UNKNOWN;
 					enumerated = 0;
-					g_hid_kind = 0;
+					g_hid_kind = USBH_HID_KIND_NONE;
 					break;
 
 				case USBH_PORT_ATTACHED:
@@ -264,19 +364,72 @@ int main( void )
 		// and the HID driver was brought up. We don't sleep
 		// aggressively - the WCH SIE will NAK if no report is ready,
 		// and the BulkOrIntrIn retry budget is 10 * 1 ms ~= 10 ms.
-		if( state == USBH_PORT_ENABLED && g_hid_kind != 0 )
+		if( state == USBH_PORT_ENABLED && g_hid_kind != USBH_HID_KIND_NONE )
 		{
-			uint8_t rep[ 8 ] = {0};
-			uint8_t r = USBH_HidReadReport( g_hid_ep, &g_hid_tog, g_hid_maxp,
-				rep, g_hid_rep_len );
+			uint8_t  raw[ USBH_HID_REPORT_MAX ];
+			uint8_t  nread = 0;
+			uint8_t  r = USBH_HidReadReport( g_hid_ep, &g_hid_tog, g_hid_maxp,
+				raw, sizeof raw, &nread );
 			if( r == USBH_ERR_SUCCESS )
 			{
-				if( g_hid_kind == 1 ) USBH_HidKbdHandle( (USBH_HidKbdReport*)rep );
-				else                  USBH_HidMouseHandle( (USBH_HidMouseReport*)rep );
+				switch( g_hid_kind )
+				{
+					case USBH_HID_KIND_KEYBOARD:
+					{
+						// Both boot- and report-protocol keyboards
+						// share the [mod,res,k0..k5] layout.
+						if( nread >= 8 ) {
+							USBH_HidKbdHandle( (USBH_HidKbdReport*)raw );
+						}
+						break;
+					}
+					case USBH_HID_KIND_MOUSE:
+					{
+						if( g_hid_rep_len == 3 )
+						{
+							// Boot mouse: 3 bytes, fixed layout.
+							USBH_HidMouseReport m = {
+								.buttons = raw[0],
+								.x = (int8_t)raw[1],
+								.y = (int8_t)raw[2]
+							};
+							USBH_HidInputReport ir = {
+								.x = m.x, .y = m.y,
+								.buttons = m.buttons
+							};
+							USBH_HidMouseHandle( &ir );
+						}
+						else
+						{
+							USBH_HidInputReport ir;
+							USBH_HidDecodeGeneric( &g_hid_desc,
+								g_hid_kind, raw, nread, &ir );
+							USBH_HidMouseHandle( &ir );
+						}
+						break;
+					}
+					case USBH_HID_KIND_GAMEPAD:
+					{
+						USBH_HidInputReport ir;
+						USBH_HidDecodeGeneric( &g_hid_desc,
+							g_hid_kind, raw, nread, &ir );
+						USBH_HidGamepadHandle( &ir );
+						break;
+					}
+					case USBH_HID_KIND_XBOX360:
+					{
+						USBH_HidX360Report xr;
+						if( USBH_HidDecodeX360( raw, nread, &xr ) == 0 )
+							USBH_HidX360Handle( &xr );
+						break;
+					}
+					default:
+						break;
+				}
 			}
 			else if( r == USBH_ERR_USB_DISCON )
 			{
-				g_hid_kind = 0;
+				g_hid_kind = USBH_HID_KIND_NONE;
 			}
 			else
 			{

@@ -28,6 +28,14 @@ uint8_t USBH_SetAddress( uint8_t ep0_size, uint8_t addr );
 // SET_CONFIGURATION. No data stage.
 uint8_t USBH_SetConfig( uint8_t ep0_size, uint8_t cfg );
 
+// GET_DESCRIPTOR(HID_REPORT) for the given interface. Caller pre-fills
+// *plen with the desired length (typically the wReportDescriptorLength
+// from the class-specific HID descriptor in the config blob). On
+// success, *plen is updated to the actual bytes read and the buffer
+// holds the report descriptor.
+uint8_t USBH_GetHidReportDesc( uint8_t ep0_size, uint8_t iface,
+                               uint8_t *pbuf, uint16_t *plen );
+
 #ifdef __cplusplus
 }
 #endif

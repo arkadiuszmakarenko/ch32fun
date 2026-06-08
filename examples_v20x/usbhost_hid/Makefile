@@ -8,7 +8,7 @@ TARGET_MCU:=CH32V203
 # the weak USBH_OnEnumSuccess() callback to bring up HID.
 # ch32fun.mk adds $(TARGET).c automatically (= usbhost_hid.c), so we
 # only list the *additional* sources here.
-ADDITIONAL_C_FILES:=usbhost_hw.c usbhost_xfer.c usbhost_std.c usbhost_enum.c
+ADDITIONAL_C_FILES:=usbhost_hw.c usbhost_xfer.c usbhost_std.c usbhost_enum.c usbhost_reportparser.c
 
 include ../../ch32fun/ch32fun.mk
 

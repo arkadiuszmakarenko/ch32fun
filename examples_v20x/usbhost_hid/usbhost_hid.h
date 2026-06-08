@@ -1,72 +1,139 @@
-// usbhost_hid.h -- minimal USB HID class driver on top of usbhost_xfer.
+// usbhost_hid.h
 //
-// Scope: claim the first HID interface, switch to boot protocol, and
-// hand callers a one-shot "read the next report" function. Keyboard
-// and mouse boot reports are the only thing decoded (boot keyboard
-// scancodes -> ASCII in main()).
+// USB HID class driver for the ch32fun USB host stack.
 //
-// This driver is intentionally tiny: it does NOT parse the HID Report
-// Descriptor. Boot protocol uses a fixed layout per device class:
-//   - Boot keyboard: 8-byte report - modifier byte, reserved byte,
-//     up to 6 keycodes, in USB HID usage order.
-//   - Boot mouse:    3-byte report - buttons, X, Y (relative).
-// Anything else (non-boot HID devices, report-protocol HID) will
-// fail the init phase and the caller will see USBH_ERR_USB_HID_NOBOOT.
+// Supports three device classes:
+//   - Boot-protocol keyboard   (8-byte fixed report)
+//   - Boot-protocol mouse      (3-byte fixed report)
+//   - Report-protocol mouse / joystick / gamepad / multi-button mouse
+//     with a HID Report Descriptor we parse dynamically. Axes, up to
+//     12 buttons, a hat, and a wheel are extracted.
+//
+// Xbox 360 controllers (VID 0x045E, PID 0x028E, plus a few clones)
+// are special-cased: they present a vendor-specific interface
+// (class 0xFF, subclass 0x5D, protocol 0x01) with a fixed 20-byte
+// input report, not a HID Report Descriptor.
 
 #ifndef USBHOST_HID_H
 #define USBHOST_HID_H
 
 #include <stdint.h>
 #include "usbhost_defs.h"
+#include "usbhost_reportparser.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// 8-byte boot keyboard report: [mod, reserved, k0, k1, k2, k3, k4, k5].
+// Class driver kinds (returned by USBH_HidInit).
+#define USBH_HID_KIND_NONE      0
+#define USBH_HID_KIND_KEYBOARD  1
+#define USBH_HID_KIND_MOUSE     2
+#define USBH_HID_KIND_GAMEPAD   3
+#define USBH_HID_KIND_XBOX360   4
+
+// Maximum HID report length we handle. The WCH SIE's full-speed
+// bulk/interrupt-IN FIFO is 64 bytes; everything in scope (mice,
+// keyboards, consumer gamepads, Xbox 360 wired controller) fits.
+#define USBH_HID_REPORT_MAX     64
+
+// Decoded input reports. The HID driver fills one of these from
+// each interrupt-IN transfer.
+
+// Boot keyboard: [mod, reserved, k0..k5]. 8 bytes.
 typedef struct {
 	uint8_t modifier;
-	// bit 0=LCTRL, 1=LSHIFT, 2=LALT, 3=LGUI,
-	// bit 4=RCTRL, 5=RSHIFT, 6=RALT, 7=RGUI
 	uint8_t reserved;
 	uint8_t keycode[6];
-	// USB HID usage IDs (0x04 = 'a', 0x05 = 'b', ...)
 } USBH_HidKbdReport;
 
+// Boot mouse: [buttons, X, Y]. 3 bytes.
 typedef struct {
 	uint8_t buttons;
-	// bit 0=L, 1=R, 2=M
 	int8_t  x;
 	int8_t  y;
 } USBH_HidMouseReport;
 
-// Set up the attached HID device:
-//   - find the first HID interface
-//   - SET_IDLE 0
-//   - SET_PROTOCOL boot
-//   - SET_CONFIGURATION is assumed to have been done by the enumerator
-// On success returns USBH_ERR_SUCCESS and fills *prep_len (the boot
-// report size, 8 for keyboard, 3 for mouse) and the interrupt-IN
-// endpoint address, max packet size, and polling interval.
-uint8_t USBH_HidInit( const uint8_t *cfg_desc, uint16_t cfg_len,
-	uint8_t *prep_len,
-	uint8_t *pin_ep,
-	uint16_t *pin_maxp,
-	uint8_t *pin_interval );
+// Generic decoded input: X / Y axes (clamped to int16_t),
+// up to 12 button bits, and an optional wheel value. Used for
+// mice (with wheel) and joysticks/gamepads.
+typedef struct {
+	int16_t x;
+	int16_t y;
+	int16_t wheel;
+	uint8_t buttons;       // primary 8 buttons (1 bit each)
+	uint8_t buttons_extra; // buttons 8..15 packed, 0 if not used
+} USBH_HidInputReport;
 
-// Read the next boot-protocol report from the interrupt-IN endpoint
-// (blocking, with retries; returns USBH_ERR_USB_DISCON on detach).
-//   ep   - endpoint number (low 4 bits)
+// Xbox 360 wired controller, 20-byte input report.
+typedef struct {
+	uint8_t  buttons_low;   // byte 2 (dpad, start, back, L3, R3)
+	uint8_t  buttons_high;  // byte 3 (LB, RB, guide, A, B, X, Y)
+	uint8_t  lt;            // byte 4 (left trigger, 0..255)
+	uint8_t  rt;            // byte 5 (right trigger, 0..255)
+	int16_t  lx, ly;        // bytes 6..9  (left stick, signed 16-bit LE)
+	int16_t  rx, ry;        // bytes 10..13 (right stick, signed 16-bit LE)
+} USBH_HidX360Report;
+
+// Set up the attached HID device:
+//   - find the first HID interface (boot- or report-protocol)
+//   - issue SET_IDLE 0
+//   - issue SET_PROTOCOL boot (only for boot-protocol devices)
+//   - for non-boot-protocol: GET_DESCRIPTOR(HID_REPORT) + parse it
+//   - for Xbox 360: leave it uninitialised and just hand back
+//     a fixed-size 20-byte report buffer
 //
-// The caller passes a per-endpoint toggle byte (initialise to 0).
+// On success returns USBH_ERR_SUCCESS and fills:
+//   *pkind      – one of USBH_HID_KIND_*
+//   *prep_len   – the report length the device will send, in bytes
+//   *pin_ep     – interrupt-IN endpoint number (low 4 bits)
+//   *pin_maxp   – endpoint wMaxPacketSize
+//   *pin_interval – endpoint bInterval
+//   *pdesc      – parsed HID Report Descriptor (only meaningful when
+//                 *pkind is MOUSE/GAMEPAD and not Xbox 360)
+//
+// *pdesc may be NULL on input if the caller doesn't need it.
+//
+// For boot-protocol devices the descriptor parser is skipped and
+// *pdesc is left zeroed.
+uint8_t USBH_HidInit( const uint8_t *dev_desc,
+                      const uint8_t *cfg_desc, uint16_t cfg_len,
+                      uint8_t *pkind,
+                      uint8_t *prep_len,
+                      uint8_t *pin_ep,
+                      uint16_t *pin_maxp,
+                      uint8_t *pin_interval,
+                      hid_report_t *pdesc );
+
+// Read the next report from the interrupt-IN endpoint (blocking,
+// with retries; returns USBH_ERR_USB_DISCON on detach). The caller
+// supplies the report buffer; the SIE fills it with up to max_len
+// bytes. After the call, *pnread holds the number of bytes actually
+// received.
 uint8_t USBH_HidReadReport( uint8_t ep, uint8_t *ptog, uint16_t maxp,
-	void *report, uint8_t report_size );
+                            void *report, uint8_t max_len,
+                            uint8_t *pnread );
 
 // Map a USB HID boot keyboard usage ID to ASCII. Returns 0 for keys
 // with no printable equivalent (modifiers, F-keys, etc). Shift is
 // handled separately by the caller (we expose the modifier byte so
 // the caller can decide).
 uint8_t USBH_HidKeyToAscii( uint8_t usage, uint8_t shift );
+
+// Decode a raw HID report into a uniform USBH_HidInputReport using
+// the parsed descriptor. Safe to call with a zeroed pdesc (all
+// fields are returned as 0 in that case).
+//
+// `kind` may be USBH_HID_KIND_MOUSE or USBH_HID_KIND_GAMEPAD. The
+// Xbox 360 path uses a separate function.
+void USBH_HidDecodeGeneric( const hid_report_t *pdesc, uint8_t kind,
+                            const uint8_t *raw, uint8_t raw_len,
+                            USBH_HidInputReport *out );
+
+// Decode the 20-byte Xbox 360 wired-controller report. Returns 0 on
+// success, non-zero if the report header isn't 0x00 0x14.
+int USBH_HidDecodeX360( const uint8_t *raw, uint8_t raw_len,
+                        USBH_HidX360Report *out );
 
 #ifdef __cplusplus
 }
