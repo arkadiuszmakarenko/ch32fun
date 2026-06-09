@@ -146,16 +146,30 @@ int parse_report_descriptor( const uint8_t *rep, uint16_t rep_size, hid_report_t
 	uint8_t  skip_collection = 0;
 	int8_t   collection_depth = 0;
 
+	// Set when the most recent global Usage Page is the Button
+	// page. Mirrors the reference firmware's parser: we only run
+	// the button-storage code on Input items inside a Button usage
+	// page, so axes / hat / wheel Inputs don't accidentally clobber
+	// button offsets.
+	uint8_t  btns = 0;
+
 	uint8_t  report_size = 0;
 	uint8_t  report_count = 0;
 	uint16_t bit_count = 0;
+	// Bit-position the next button Input should start writing at.
+	// Some descriptors split the button field across two or more
+	// Input items (e.g. 10 buttons of 1 bit each on one Input, then
+	// 2 more buttons on a follow-up Input). We need to *append* to
+	// the button array, not overwrite it from index 0 each time.
+	uint16_t button_bit_pos = 0;
 	uint16_t usage_count = 0;
 	uint16_t logical_minimum = 0;
 	uint16_t logical_maximum = 0;
 
 	uint8_t  report_complete = 0;
 
-	int8_t   axis[2] = { -1, -1 };
+	int8_t   axis[USBH_REPORT_AXES];
+	for( uint8_t i = 0; i < USBH_REPORT_AXES; i++ ) axis[i] = -1;
 	int8_t   hat = -1;
 	int8_t   wheel = -1;
 
@@ -203,29 +217,48 @@ int parse_report_descriptor( const uint8_t *rep, uint16_t rep_size, hid_report_t
 				{
 					case 8:  // Input
 					{
-						// Buttons: collect up to USBH_REPORT_BUTTONS bits.
-						// (Most devices emit one bit per button; we
-						// record the byte/bit of each, plus a total
-						// count of button-bits so the decoder can
-						// reach button[4..11] even when the parser
-						// only stored offsets for the first four.)
-						uint8_t b;
-						for( b = 0; b < USBH_REPORT_BUTTONS; b++ )
+						// Diagnostic: per-Input trace so we can verify
+						// the parser's bit_count accounting matches
+						// the device's actual report layout.
+						printf( "  rp: INPUT btns=%u cnt=%u sz=%u bit_count=%u\n",
+							btns, report_count, report_size, bit_count );
+						// Buttons: only run on Input items that come
+						// after a Button Usage Page. Multiple
+						// button Inputs in a row are *appended* to
+						// the button array (some pads split the
+						// button field across several Inputs).
+						if( btns )
 						{
-							if( b < report_count )
+							uint8_t b;
+							for( b = 0; b < USBH_REPORT_BUTTONS; b++ )
 							{
-								uint16_t this_bit = (uint16_t)( bit_count + b );
-								conf->button[b].byte_offset = (uint8_t)( this_bit / 8 );
-								conf->button[b].bitmask     = (uint8_t)( 1u << ( this_bit & 7 ) );
+								uint8_t slot = (uint8_t)( button_bit_pos + b );
+								if( slot >= USBH_REPORT_BUTTONS ) break;
+								if( b < report_count )
+								{
+									uint16_t this_bit = (uint16_t)( bit_count + b );
+									conf->button[slot].byte_offset = (uint8_t)( this_bit / 8 );
+									conf->button[slot].bitmask     = (uint8_t)( 1u << ( this_bit & 7 ) );
+								}
 							}
+							// Advance the running bit position for
+							// the *next* button Input, and bump the
+							// total button_count by the bits we just
+							// consumed.
+							button_bit_pos = (uint16_t)( button_bit_pos + report_count );
+							conf->button_count = (uint8_t)( button_bit_pos );
+							if( conf->button_count > 0 ) report_complete |= RP_MOUSE_BTN0;
+							if( conf->button_count > 1 ) report_complete |= RP_MOUSE_BTN1;
 						}
-						conf->button_count = (uint8_t)( report_count * report_size );
-						if( conf->button_count > 0 ) report_complete |= RP_MOUSE_BTN0;
-						if( conf->button_count > 1 ) report_complete |= RP_MOUSE_BTN1;
 
-						// Axes.
+						// Axes. Most gamepads expose X/Y for stick 1
+						// and Rx/Ry (or Z/Rz) for stick 2. The
+						// parser fills them in in usage order, so
+						// axis[0..1] is always stick 1, axis[2..3]
+						// is stick 2 (or hat-as-axes on a pad
+						// that doesn't use a hat switch).
 						uint8_t c;
-						for( c = 0; c < 2; c++ )
+						for( c = 0; c < USBH_REPORT_AXES; c++ )
 						{
 							if( axis[c] >= 0 )
 							{
@@ -260,7 +293,7 @@ int parse_report_descriptor( const uint8_t *rep, uint16_t rep_size, hid_report_t
 						// Reset per-field state.
 						bit_count = (uint16_t)( bit_count + report_count * report_size );
 						usage_count = 0;
-						axis[0] = axis[1] = -1;
+						for( uint8_t i = 0; i < USBH_REPORT_AXES; i++ ) axis[i] = -1;
 						hat = -1;
 						wheel = -1;
 						break;
@@ -324,7 +357,12 @@ int parse_report_descriptor( const uint8_t *rep, uint16_t rep_size, hid_report_t
 			{
 				switch( tag )
 				{
-					case 0:  // Usage Page — nothing to do
+					case 0:  // Usage Page
+						// 0x09 = Button. Set the btns flag so the
+						// next Input item is treated as buttons.
+						// Reset on any other page.
+						btns = ( value == 0x09u ) ? 1u : 0u;
+						break;
 					case 3:  // Physical Minimum
 					case 4:  // Physical Maximum
 					case 5:  // Unit Exponent
@@ -361,13 +399,27 @@ int parse_report_descriptor( const uint8_t *rep, uint16_t rep_size, hid_report_t
 						{
 							// In an application collection, X/Y = axis,
 							// pointer is allowed, hat/wheel too.
-							if( value == 48 /*X*/ || value == 49 /*Y*/ )
+							// Twin USB and many clone pads use Z/Rz
+							// for the second stick — treat those as
+							// additional axes. Rx/Ry are also common.
+							if( ( conf->type == USBH_REPORT_TYPE_JOYSTICK ||
+							      conf->type == USBH_REPORT_TYPE_MOUSE ) &&
+							    ( value == 48 /*X*/  || value == 49 /*Y*/ ||
+							      value == 50 /*Z*/  || value == 51 /*Rx*/ ||
+							      value == 52 /*Ry*/ || value == 53 /*Rz*/ ) )
 							{
-								if( conf->type == USBH_REPORT_TYPE_JOYSTICK ||
-								    conf->type == USBH_REPORT_TYPE_MOUSE )
+								uint8_t slot = 0;
+								if(      value == 48 || value == 51 ) slot = 0;  // X  or Rx
+								else if( value == 49 || value == 52 ) slot = 1;  // Y  or Ry
+								else if( value == 50 || value == 53 ) slot = 2;  // Z  or Rz
+								// Find the first free axis slot starting
+								// from `slot`. Twin USB pads use Z/Rz
+								// for the second stick — those go to
+								// axis[2]/axis[3] in usage order.
+								while( slot < USBH_REPORT_AXES && axis[slot] >= 0 ) slot++;
+								if( slot < USBH_REPORT_AXES )
 								{
-									if( value == 48 )      axis[0] = (int8_t)usage_count;
-									else                   axis[1] = (int8_t)usage_count;
+									axis[slot] = (int8_t)usage_count;
 								}
 							}
 							else if( value == 57 /*HAT*/ &&
@@ -411,6 +463,10 @@ int parse_report_descriptor( const uint8_t *rep, uint16_t rep_size, hid_report_t
 		}
 	}
 
+	// Diagnostic: print final bit_count so we can see what the
+	// parser thinks the report length is.
+	printf( "  rp: end bit_count=%u report_size=%u button_count=%u\n",
+		bit_count, conf->report_size, conf->button_count );
 	// Descriptor ended without an End-Collection. Still accept if usable.
 	if( !report_is_usable( bit_count, report_complete, conf ) )
 	{

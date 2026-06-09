@@ -188,23 +188,97 @@ static void USBH_HidKbdHandle( const USBH_HidKbdReport *r )
 
 static void USBH_HidMouseHandle( const USBH_HidInputReport *r )
 {
-	if( r->buttons || r->x || r->y || r->wheel ||
+	if( r->buttons || r->axis[0] || r->axis[1] || r->wheel ||
 	    r->buttons_extra )
 	{
 		printf( "[mouse] btn=%02x btnX=%02x dx=%d dy=%d wheel=%d\n",
 			r->buttons, r->buttons_extra,
-			(int)r->x, (int)r->y, (int)r->wheel );
+			(int)r->axis[0], (int)r->axis[1], (int)r->wheel );
 	}
+}
+
+// Prev-state for the gamepad, so we can fire "press" / "release"
+// events rather than spamming a line per report. Reset on detach
+// (handled by main()).
+static struct {
+	uint8_t  buttons;
+	uint8_t  buttons_extra;
+	int16_t  axis[4];
+} g_pad_prev;
+
+// Centre an unsigned axis on its midpoint and return the signed
+// delta clamped to int8_t range. The midpoint is `(min + max) / 2`,
+// matching the integer truncation the device uses internally: a
+// 0..255 axis centres at 127, so the at-rest value 127 produces a
+// delta of 0 (no quantisation error).
+//
+// Signed axes (declared with `min > max` in the descriptor) are
+// passed through unchanged.
+static int16_t USBH_AxisCentre( int16_t raw, uint16_t lmin, uint16_t lmax,
+                                uint8_t size )
+{
+	// Skip 1-bit axes (booleans / padding) and degenerate ranges.
+	if( size == 0 || size == 1 ) return 0;
+	if( lmin == lmax )           return 0;
+	if( lmin == 0 && lmax == 1 ) return 0;  // boolean / hat-bit
+
+	if( lmin > lmax )
+	{
+		// Signed axis — pass through (the descriptor used the
+		// min > max convention to declare a signed value).
+		return raw;
+	}
+	// Truncated midpoint: matches what the device sends.
+	int32_t mid = ( (int32_t)lmin + (int32_t)lmax ) / 2;
+	int32_t v   = (int32_t)raw - mid;
+	if( v >  127 ) v =  127;
+	if( v < -128 ) v = -128;
+	return (int16_t)v;
 }
 
 static void USBH_HidGamepadHandle( const USBH_HidInputReport *r )
 {
-	if( r->buttons || r->buttons_extra || r->x || r->y )
+	// Print on any state change. We *always* print something so
+	// the user sees releases (going back to centre) and sticks
+	// moving past a small dead-zone.
+	uint8_t btn_now  = r->buttons;
+	uint8_t btnX_now = r->buttons_extra;
+
+	uint8_t btn_press   = (uint8_t)( btn_now  & ~g_pad_prev.buttons );
+	uint8_t btn_release = (uint8_t)( ~btn_now  &  g_pad_prev.buttons );
+	uint8_t btnX_press  = (uint8_t)( btnX_now & ~g_pad_prev.buttons_extra );
+	uint8_t btnX_release= (uint8_t)( ~btnX_now &  g_pad_prev.buttons_extra );
+
+	// Centre each axis on its midpoint using the parsed logical
+	// range. The 4 axes are X / Y / Z(or Rx) / Rz(or Ry) in
+	// usage order from the parser.
+	int16_t ax[4];
+	for( uint8_t i = 0; i < 4; i++ )
 	{
-		printf( "[gamepad] btn=%02x btnX=%02x x=%d y=%d\n",
-			r->buttons, r->buttons_extra,
-			(int)r->x, (int)r->y );
+		ax[i] = USBH_AxisCentre( r->axis[i],
+			g_hid_desc.axis[i].logical.min,
+			g_hid_desc.axis[i].logical.max,
+			g_hid_desc.axis[i].size );
 	}
+
+	int moved = 0;
+	for( uint8_t i = 0; i < 4; i++ )
+	{
+		if( ax[i] != g_pad_prev.axis[i] ) { moved = 1; break; }
+	}
+
+	if( btn_press || btn_release || btnX_press || btnX_release || moved )
+	{
+		printf( "[gamepad] btn=%02x%s btnX=%02x%s "
+			"X=%4d Y=%4d Rx=%4d Ry=%4d\n",
+			btn_now,  btn_press   ? "+" : ( btn_release   ? "-" : "" ),
+			btnX_now, btnX_press  ? "+" : ( btnX_release  ? "-" : "" ),
+			(int)ax[0], (int)ax[1], (int)ax[2], (int)ax[3] );
+	}
+
+	g_pad_prev.buttons       = btn_now;
+	g_pad_prev.buttons_extra = btnX_now;
+	for( uint8_t i = 0; i < 4; i++ ) g_pad_prev.axis[i] = ax[i];
 }
 
 static const char *USBH_XboxBtnName( uint8_t b )
@@ -315,6 +389,7 @@ int main( void )
 					speed = USB_SPEED_UNKNOWN;
 					enumerated = 0;
 					g_hid_kind = USBH_HID_KIND_NONE;
+					memset( &g_pad_prev, 0, sizeof g_pad_prev );
 					break;
 
 				case USBH_PORT_ATTACHED:
@@ -393,10 +468,11 @@ int main( void )
 								.x = (int8_t)raw[1],
 								.y = (int8_t)raw[2]
 							};
-							USBH_HidInputReport ir = {
-								.x = m.x, .y = m.y,
-								.buttons = m.buttons
-							};
+							USBH_HidInputReport ir;
+							memset( &ir, 0, sizeof ir );
+							ir.axis[0] = m.x;
+							ir.axis[1] = m.y;
+							ir.buttons = m.buttons;
 							USBH_HidMouseHandle( &ir );
 						}
 						else
@@ -413,6 +489,28 @@ int main( void )
 						USBH_HidInputReport ir;
 						USBH_HidDecodeGeneric( &g_hid_desc,
 							g_hid_kind, raw, nread, &ir );
+						// If we don't see any button change after a
+						// while, dump the raw report bytes once to
+						// help diagnose layout issues. The dump is
+						// throttled to once per N reports.
+						{
+							static uint32_t dump_counter = 0;
+							static uint8_t  last_dumped[16] = {0};
+							uint8_t changed = 0;
+							for( uint8_t i = 0; i < nread && i < 16; i++ )
+							{
+								if( raw[i] != last_dumped[i] ) { changed = 1; break; }
+							}
+							if( changed || ( dump_counter & 0xff ) == 0 )
+							{
+								printf( "[hid] raw[%u]:", nread );
+								for( uint8_t i = 0; i < nread && i < 16; i++ )
+									printf( " %02x", raw[i] );
+								printf( "\n" );
+								memcpy( last_dumped, raw, nread < 16 ? nread : 16 );
+							}
+							dump_counter++;
+						}
 						USBH_HidGamepadHandle( &ir );
 						break;
 					}

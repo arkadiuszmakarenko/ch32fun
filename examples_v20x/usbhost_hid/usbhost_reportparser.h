@@ -38,7 +38,7 @@ extern "C" {
 #define USBH_REPORT_TYPE_KEYBOARD 2
 #define USBH_REPORT_TYPE_JOYSTICK 3
 
-#define USBH_REPORT_AXES     2
+#define USBH_REPORT_AXES     4   // up to 4 axes (X/Y + Rx/Ry for 2nd stick)
 #define USBH_REPORT_BUTTONS  12
 
 typedef struct {

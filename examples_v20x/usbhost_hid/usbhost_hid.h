@@ -54,15 +54,15 @@ typedef struct {
 	int8_t  y;
 } USBH_HidMouseReport;
 
-// Generic decoded input: X / Y axes (clamped to int16_t),
-// up to 12 button bits, and an optional wheel value. Used for
-// mice (with wheel) and joysticks/gamepads.
+// Generic decoded input: up to 4 axes (X / Y / Rx / Ry), wheel, and
+// 12 button bits. Values are the *raw* field values pulled out of
+// the report, no centring. The application is expected to apply
+// dead-zones and centring using pdesc->axis[c].logical.{min,max}.
 typedef struct {
-	int16_t x;
-	int16_t y;
+	int16_t axis[4];      // axis[0]=X, [1]=Y, [2]=Z/Rx, [3]=Rz/Ry
 	int16_t wheel;
 	uint8_t buttons;       // primary 8 buttons (1 bit each)
-	uint8_t buttons_extra; // buttons 8..15 packed, 0 if not used
+	uint8_t buttons_extra; // buttons 8..11 packed, 0 if not used
 } USBH_HidInputReport;
 
 // Xbox 360 wired controller, 20-byte input report.

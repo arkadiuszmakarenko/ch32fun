@@ -53,7 +53,7 @@
 #define USBH_HID_EP_TYPE_INTR      0x03u
 
 // Sizes.
-#define USBH_HID_REP_DESC_MAX      256u   // generous for mice / pads
+#define USBH_HID_REP_DESC_MAX      512u   // Twin USB / many pads are 250-400 bytes
 #define USBH_HID_REP_LEN_BOOT_KBD  8u
 #define USBH_HID_REP_LEN_BOOT_MSE  3u
 #define USBH_HID_REP_LEN_XBOX360   20u
@@ -374,6 +374,18 @@ uint8_t USBH_HidInit( const uint8_t *dev_desc,
 								pdesc->axis[1].size, pdesc->axis[1].logical.min,
 								pdesc->wheel.size,  pdesc->wheel.logical.min,
 								pdesc->hat.size,    pdesc->hat.logical.min );
+							// Dump per-button offset/bitmask so we
+							// can verify the layout the decoder will
+							// see. 8 buttons fit on one line.
+							printf( "HID: btn layout:" );
+							for( uint8_t k = 0; k < 12; k++ )
+							{
+								if( k >= pdesc->button_count ) break;
+								printf( " [%u]=%u/%02x",
+									k, pdesc->button[k].byte_offset,
+									pdesc->button[k].bitmask );
+							}
+							printf( "\n" );
 						}
 						if( pr )
 						{
@@ -529,8 +541,14 @@ uint8_t USBH_HidReadReport( uint8_t ep, uint8_t *ptog, uint16_t maxp,
 // Read a raw HID report through the parsed descriptor and produce
 // a USBH_HidInputReport. Handles signed axes (a logical_minimum >
 // logical_maximum in the descriptor is HID's way of saying "this
-// field is signed"; we honor that) and multi-bit buttons (e.g. a
-// 16-bit hat switch with logical_min=1, logical_max=8).
+// field is signed"; we honor that) and multi-bit buttons.
+//
+// All axis values are returned *raw* — the application is expected
+// to apply centring and dead-zones using
+// pdesc->axis[c].logical.{min,max}.
+//
+// `kind` may be USBH_HID_KIND_MOUSE or USBH_HID_KIND_GAMEPAD. The
+// Xbox 360 path uses a separate function.
 // ---------------------------------------------------------------------------
 void USBH_HidDecodeGeneric( const hid_report_t *pdesc, uint8_t kind,
                             const uint8_t *raw, uint8_t raw_len,
@@ -549,42 +567,20 @@ void USBH_HidDecodeGeneric( const hid_report_t *pdesc, uint8_t kind,
 
 	(void)kind;
 
-	// ---- X / Y axes ----
-	for( uint8_t c = 0; c < 2; c++ )
+	// ---- Axes (up to 4) ----
+	// Read each axis as a raw field. HID sign convention:
+	// logical_minimum > logical_maximum means "signed" (some
+	// devices use this; we follow it).
+	for( uint8_t c = 0; c < 4; c++ )
 	{
 		if( pdesc->axis[c].size == 0 ) continue;
-		// HID sign convention: logical_minimum > logical_maximum
-		// means "this value is signed".
 		int is_signed = ( pdesc->axis[c].logical.min >
 		                  pdesc->axis[c].logical.max );
 		uint16_t v = collect_bits( p, pdesc->axis[c].offset,
 		                           pdesc->axis[c].size, is_signed );
-		int16_t sv;
-		if( is_signed )
-		{
-			// Sign-extend manually: collect_bits() returns a
-			// uint16_t; convert to int16_t with explicit cast.
-			sv = (int16_t)v;
-		}
-		else
-		{
-			// Centre on the midpoint, like the reference
-			// firmware's usb_mouse.c does. For mice, the axis
-			// value is relative and we want a small int8_t-like
-			// delta; for joysticks the caller can re-centre.
-			uint16_t mn = pdesc->axis[c].logical.min;
-			uint16_t mx = pdesc->axis[c].logical.max;
-			if( mx <= mn ) continue;
-			uint16_t mid = (uint16_t)( ( mn + mx ) / 2u );
-			sv = (int16_t)( (int)mid - (int)v );
-			// Note: this inverts (toward-top = negative); some
-			// callers may prefer the raw value. We leave that
-			// to the application.
-		}
-		if( c == 0 )      out->x = sv;
-		else if( c == 1 ) out->y = sv;
-		(void)plen;
+		out->axis[c] = (int16_t)v;
 	}
+	(void)plen;
 
 	// ---- Wheel (mice only) ----
 	if( pdesc->wheel.size > 0 )
@@ -593,40 +589,21 @@ void USBH_HidDecodeGeneric( const hid_report_t *pdesc, uint8_t kind,
 		                  pdesc->wheel.logical.max );
 		uint16_t v = collect_bits( p, pdesc->wheel.offset,
 		                           pdesc->wheel.size, is_signed );
-		out->wheel = is_signed ? (int16_t)v : (int16_t)( v );
+		out->wheel = (int16_t)v;
 	}
 
 	// ---- Buttons (up to 12 bits) ----
+	// The parser stores byte_offset and bitmask for each button
+	// directly in the descriptor. We index into `p` (which has
+	// the report ID byte already stripped) using the same offset;
+	// because the parser computed offsets from the start of the
+	// data (after the report ID), this is consistent.
 	for( uint8_t b = 0; b < USBH_REPORT_BUTTONS; b++ )
 	{
 		if( b >= pdesc->button_count ) break;
-		// If the parser only filled in button[0..3] because the
-		// report had report_count > 4 buttons, fall back to a
-		// simple bit-by-bit scan starting at bit_count.
-		if( pdesc->button[b].bitmask == 0 &&
-		    pdesc->button[b].byte_offset == 0 &&
-		    b >= 4 )
-		{
-			// Synthetic: bit `b` lives at offset
-			// (axis[0] + axis[1] + b) in the report. Re-derive
-			// from the buttons-count we know.
-			// (In practice our parser stores the byte/offset
-			// for the first 4 buttons; for b >= 4 we read
-			// sequentially from the start of the buttons
-			// region.)
-			uint16_t btn_bit = (uint16_t)( pdesc->axis[0].size +
-			                              pdesc->axis[1].size + b );
-			uint8_t  byte = (uint8_t)( btn_bit / 8 );
-			uint8_t  bit  = (uint8_t)( btn_bit & 7 );
-			if( byte < plen && ( p[byte] & ( 1u << bit ) ) )
-			{
-				if( b < 8 ) out->buttons       |= (uint8_t)( 1u << b );
-				else        out->buttons_extra |= (uint8_t)( 1u << ( b - 8 ) );
-			}
-			continue;
-		}
-		if( pdesc->button[b].byte_offset < plen &&
-		    ( p[ pdesc->button[b].byte_offset ] & pdesc->button[b].bitmask ) )
+		if( pdesc->button[b].bitmask == 0 ) continue;  // not present
+		if( pdesc->button[b].byte_offset >= plen ) continue;
+		if( p[ pdesc->button[b].byte_offset ] & pdesc->button[b].bitmask )
 		{
 			if( b < 8 ) out->buttons       |= (uint8_t)( 1u << b );
 			else        out->buttons_extra |= (uint8_t)( 1u << ( b - 8 ) );
