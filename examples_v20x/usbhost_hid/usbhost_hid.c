@@ -592,6 +592,20 @@ void USBH_HidDecodeGeneric( const hid_report_t *pdesc, uint8_t kind,
 		out->wheel = (int16_t)v;
 	}
 
+	// ---- Hat switch (joysticks / d-pad-as-hat) ----
+	// The HID Hat Switch usage is 4 bits, value 0..8 (or 15 for
+	// null). We return the raw nibble so the caller can interpret
+	// 0..8 = N..NW, 15 = null. We do *not* check the size here
+	// against a specific value because some devices report the hat
+	// as 1 bit, 4 bits, or even 8 bits; any non-zero size means
+	// "a hat-like field is here, decode it".
+	if( pdesc->hat.size > 0 )
+	{
+		uint16_t v = collect_bits( p, pdesc->hat.offset,
+		                           pdesc->hat.size, 0 );
+		out->hat = (uint8_t)( v & 0x0Fu );
+	}
+
 	// ---- Buttons (up to 12 bits) ----
 	// The parser stores byte_offset and bitmask for each button
 	// directly in the descriptor. We index into `p` (which has

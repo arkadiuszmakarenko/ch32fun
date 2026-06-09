@@ -204,7 +204,26 @@ static struct {
 	uint8_t  buttons;
 	uint8_t  buttons_extra;
 	int16_t  axis[4];
+	uint8_t  hat;     // 0 = centre, 1..8 = N..NW, 15 = null
 } g_pad_prev;
+
+static const char *USBH_HatName( uint8_t hat )
+{
+	switch( hat )
+	{
+		case 0:  return "-";
+		case 1:  return "N";
+		case 2:  return "NE";
+		case 3:  return "E";
+		case 4:  return "SE";
+		case 5:  return "S";
+		case 6:  return "SW";
+		case 7:  return "W";
+		case 8:  return "NW";
+		case 15: return "null";
+		default: return "?";
+	}
+}
 
 // Centre an unsigned axis on its midpoint and return the signed
 // delta clamped to int8_t range. The midpoint is `(min + max) / 2`,
@@ -243,6 +262,7 @@ static void USBH_HidGamepadHandle( const USBH_HidInputReport *r )
 	// moving past a small dead-zone.
 	uint8_t btn_now  = r->buttons;
 	uint8_t btnX_now = r->buttons_extra;
+	uint8_t hat_now  = r->hat;
 
 	uint8_t btn_press   = (uint8_t)( btn_now  & ~g_pad_prev.buttons );
 	uint8_t btn_release = (uint8_t)( ~btn_now  &  g_pad_prev.buttons );
@@ -267,18 +287,22 @@ static void USBH_HidGamepadHandle( const USBH_HidInputReport *r )
 		if( ax[i] != g_pad_prev.axis[i] ) { moved = 1; break; }
 	}
 
-	if( btn_press || btn_release || btnX_press || btnX_release || moved )
+	int hat_changed = ( hat_now != g_pad_prev.hat );
+
+	if( btn_press || btn_release || btnX_press || btnX_release || moved || hat_changed )
 	{
-		printf( "[gamepad] btn=%02x%s btnX=%02x%s "
+		printf( "[gamepad] btn=%02x%s btnX=%02x%s hat=%2u(%s) "
 			"X=%4d Y=%4d Rx=%4d Ry=%4d\n",
 			btn_now,  btn_press   ? "+" : ( btn_release   ? "-" : "" ),
 			btnX_now, btnX_press  ? "+" : ( btnX_release  ? "-" : "" ),
+			(unsigned)hat_now, USBH_HatName( hat_now ),
 			(int)ax[0], (int)ax[1], (int)ax[2], (int)ax[3] );
 	}
 
 	g_pad_prev.buttons       = btn_now;
 	g_pad_prev.buttons_extra = btnX_now;
 	for( uint8_t i = 0; i < 4; i++ ) g_pad_prev.axis[i] = ax[i];
+	g_pad_prev.hat = hat_now;
 }
 
 static const char *USBH_XboxBtnName( uint8_t b )
@@ -390,6 +414,7 @@ int main( void )
 					enumerated = 0;
 					g_hid_kind = USBH_HID_KIND_NONE;
 					memset( &g_pad_prev, 0, sizeof g_pad_prev );
+					g_pad_prev.hat = 0xFFu;  // force a "null → centre" print on next attach
 					break;
 
 				case USBH_PORT_ATTACHED:
